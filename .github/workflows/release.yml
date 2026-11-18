@@ -1,0 +1,316 @@
+name: Release
+
+# This repository owns public artifacts. Source is checked out from the private
+# repository at the requested tag using SOURCE_TOKEN.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: v-prefixed release tag (leave blank to increment the latest public patch version)
+        required: false
+        type: string
+      ref:
+        description: source branch or commit to tag when the tag does not exist yet
+        required: false
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  # The private source repository (owner/name), kept as a secret so it never shows in logs.
+  SOURCE_REPO: ${{ secrets.SOURCE_REPO }}
+
+jobs:
+  # Validates the tag and, if the source does not have it yet, tags `ref`
+  # there first (SOURCE_TOKEN needs Contents: write on the source for that).
+  tag:
+    name: ensure source tag
+    runs-on: ubuntu-latest
+    environment: production
+    outputs:
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
+    steps:
+      - name: Resolve and validate release tag
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$RELEASE_TAG" ]]; then
+            tags="$(gh api --paginate "repos/${{ github.repository }}/tags?per_page=100" --jq '.[].name')"
+            latest="$(printf '%s\n' "$tags" | { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; } | sort -V | tail -n 1)"
+            if [[ -z "$latest" ]]; then
+              echo "No stable public version tag found; provide an explicit release tag" >&2
+              exit 1
+            fi
+            RELEASE_TAG="${latest%.*}.$((10#${latest##*.} + 1))"
+            echo "Next release tag: $RELEASE_TAG (latest: $latest)"
+          fi
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]] || {
+            echo "release tag must look like v1.2.3" >&2
+            exit 1
+          }
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Create the tag in the source if missing
+        env:
+          RELEASE_TAG: ${{ steps.resolve.outputs.release_tag }}
+          GH_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+          SOURCE_REF: ${{ inputs.ref || 'main' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh api "repos/$SOURCE_REPO/git/ref/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "$RELEASE_TAG already exists in $SOURCE_REPO"
+            exit 0
+          fi
+          sha="$(gh api "repos/$SOURCE_REPO/commits/$SOURCE_REF" --jq .sha)"
+          gh api "repos/$SOURCE_REPO/git/refs" -f "ref=refs/tags/$RELEASE_TAG" -f "sha=$sha" >/dev/null
+          echo "Tagged $SOURCE_REPO@$SOURCE_REF ($sha) as $RELEASE_TAG"
+
+  # Everything is pure Go (no cgo), so one macOS runner cross-compiles every
+  # target; macOS is only needed for signing, the disk images and notarizing.
+  build:
+    name: build
+    needs: tag
+    runs-on: macos-15
+    environment: production
+    env:
+      RELEASE_TAG: ${{ needs.tag.outputs.release_tag }}
+    steps:
+      - name: Checkout private source at tag
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.RELEASE_TAG }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          fetch-depth: 1
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            desktop/go.sum
+
+      - name: Build the CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          module="$(awk '/^module /{print $2}' go.mod)"
+          mkdir -p dist
+          for pair in darwin/arm64:macos-arm64 darwin/amd64:macos-x64 linux/arm64:linux-arm64 linux/amd64:linux-x64; do
+            target="${pair%%:*}" name="bit-${version}-${pair#*:}"
+            CGO_ENABLED=0 GOOS="${target%/*}" GOARCH="${target#*/}" go build -trimpath \
+              -ldflags "-s -w -X ${module}/cli.Version=${version}" \
+              -o "dist/${name}/bit" ./cmd/bit
+            COPYFILE_DISABLE=1 tar -C dist -czf "dist/${name}.tar.gz" "$name"
+            rm -rf "dist/${name}"
+          done
+
+      # Optional Developer ID signing. Without MACOS_CERTIFICATE_P12 the app is
+      # ad-hoc signed: it runs, but a browser-downloaded copy is quarantined and
+      # Gatekeeper reports it as "damaged" until `xattr -dr
+      # com.apple.quarantine Bit.app`. The .p12 is a Developer ID Application
+      # certificate with its private key, base64-encoded.
+      - name: Import the Developer ID certificate
+        id: signing
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${CERT_P12:-}" ]]; then
+            echo "::warning::MACOS_CERTIFICATE_P12 is not set; Bit.app is ad-hoc signed and not notarized"
+            echo "identity=-" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          password="$(openssl rand -hex 16)"
+          printf '%s' "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          rm "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          identity="$(security find-identity -v -p codesigning "$keychain" |
+            sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -n 1)"
+          [[ -n "$identity" ]] || { echo "the certificate holds no Developer ID Application identity" >&2; exit 1; }
+          echo "identity=$identity" >> "$GITHUB_OUTPUT"
+
+      # The source stays at its placeholder version; the app reports the tag.
+      - name: Build the desktop app
+        working-directory: desktop
+        env:
+          SIGN_IDENTITY: ${{ steps.signing.outputs.identity }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq --arg v "${RELEASE_TAG#v}" '.version = $v' mygo.json > mygo.json.tmp && mv mygo.json.tmp mygo.json
+          go tool mygo build -sign "$SIGN_IDENTITY" \
+            -platform darwin/arm64,darwin/amd64,linux/arm64,linux/amd64
+
+      # Notarizing needs an App Store Connect API key (Developer role): the .p8
+      # contents, its key id and its issuer id. The ticket is stapled into each
+      # disk image, so Gatekeeper accepts it offline too.
+      - name: Notarize the disk images
+        if: steps.signing.outputs.identity != '-'
+        env:
+          API_KEY: ${{ secrets.APPLE_API_KEY_P8 }}
+          API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -n "${API_KEY:-}" && -n "${API_KEY_ID:-}" && -n "${API_ISSUER_ID:-}" ]] || {
+            echo "Developer ID signing is set up, so APPLE_API_KEY_P8, APPLE_API_KEY_ID and APPLE_API_ISSUER_ID are required" >&2
+            exit 1
+          }
+          key="$RUNNER_TEMP/notary.p8"
+          printf '%s\n' "$API_KEY" > "$key"
+          for dmg in desktop/build/darwin-*/*.dmg; do
+            result="$(xcrun notarytool submit "$dmg" \
+              --key "$key" --key-id "$API_KEY_ID" --issuer "$API_ISSUER_ID" \
+              --wait --output-format json)"
+            echo "$result"
+            if [[ "$(jq -r .status <<<"$result")" != Accepted ]]; then
+              xcrun notarytool log "$(jq -r .id <<<"$result")" \
+                --key "$key" --key-id "$API_KEY_ID" --issuer "$API_ISSUER_ID" || true
+              exit 1
+            fi
+            xcrun stapler staple "$dmg"
+          done
+          rm "$key"
+
+      # Desktop files are renamed to bit-desktop-* so they never collide with
+      # the CLI archives, and use the same x64/arm64 names.
+      - name: Collect desktop files
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          for goarch in arm64:arm64 amd64:x64; do
+            go="${goarch%%:*}" arch="${goarch#*:}"
+            mv "desktop/build/darwin-${go}"/*.dmg "dist/bit-desktop-${version}-macos-${arch}.dmg"
+            mv "desktop/build/linux-${go}/bit-${version}-linux-${go}.tar.gz" "dist/bit-desktop-${version}-linux-${arch}.tar.gz"
+            mv "desktop/build/linux-${go}"/*.deb "dist/bit-desktop_${version}_${arch}.deb"
+            mv "desktop/build/linux-${go}"/*.rpm "dist/bit-desktop-${version}-linux-${arch}.rpm"
+          done
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: publish GitHub release
+    needs: [tag, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ needs.tag.outputs.release_tag }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release
+          path: dist
+
+      - name: Create checksums
+        working-directory: dist
+        run: sha256sum -- * > checksums.txt
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          repo="${{ github.repository }}"
+          if gh release view "$RELEASE_TAG" -R "$repo" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* -R "$repo" --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/* -R "$repo" \
+              --title "$RELEASE_TAG" --generate-notes --target "${{ github.sha }}"
+          fi
+
+  homebrew:
+    name: update Homebrew tap
+    needs: [tag, publish]
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      RELEASE_TAG: ${{ needs.tag.outputs.release_tag }}
+    steps:
+      - name: Render and push formula
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${TAP_TOKEN:-}" ]]; then
+            echo "HOMEBREW_TAP_GITHUB_TOKEN is not set; skipping tap update" >&2
+            exit 0
+          fi
+          version="${RELEASE_TAG#v}"
+          base="https://github.com/${{ github.repository }}/releases/download/${RELEASE_TAG}"
+          gh release download "$RELEASE_TAG" -R "${{ github.repository }}" \
+            -p checksums.txt -O checksums.txt --clobber
+          sha() { grep " bit-${version}-$1.tar.gz$" checksums.txt | awk '{print $1}'; }
+
+          cat > bit.rb <<EOF
+          class Bit < Formula
+            desc "Coding agent with a CLI, TUI, server and desktop app"
+            homepage "https://github.com/ahmed3mar/bit"
+            version "${version}"
+
+            on_macos do
+              on_arm do
+                url "${base}/bit-${version}-macos-arm64.tar.gz"
+                sha256 "$(sha macos-arm64)"
+              end
+              on_intel do
+                url "${base}/bit-${version}-macos-x64.tar.gz"
+                sha256 "$(sha macos-x64)"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "${base}/bit-${version}-linux-arm64.tar.gz"
+                sha256 "$(sha linux-arm64)"
+              end
+              on_intel do
+                url "${base}/bit-${version}-linux-x64.tar.gz"
+                sha256 "$(sha linux-x64)"
+              end
+            end
+
+            def install
+              bin.install "bit"
+            end
+
+            test do
+              assert_predicate bin/"bit", :executable?
+            end
+          end
+          EOF
+
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/ahmed3mar/homebrew-tap.git" tap
+          mkdir -p tap/Formula
+          mv bit.rb tap/Formula/bit.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/bit.rb
+          git commit -m "bit ${version}" || { echo "no formula change"; exit 0; }
+          git push
