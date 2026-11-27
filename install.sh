@@ -65,6 +65,16 @@ mkdir -p "$INSTALL_DIR"
 install -m 755 "$source" "$INSTALL_DIR/bit"
 
 printf 'Installed bit v%s to %s/bit\n' "$VERSION" "$INSTALL_DIR"
+
+# The worker plugin (bit worker), from v0.0.2: kept where bit update finds and updates it.
+worker="$tmp/bit-${VERSION}-${platform}-${arch}/worker"
+if [ -d "$worker" ]; then
+  share="${XDG_DATA_HOME:-$HOME/.local/share}/bit/worker"
+  rm -rf "$share" && mkdir -p "$(dirname "$share")" && cp -R "$worker" "$share"
+  "$INSTALL_DIR/bit" plugin install "$share" -y >/dev/null 2>&1 \
+    && printf 'Installed the worker plugin to %s\n' "$share" \
+    || printf 'The worker plugin is in %s: bit plugin install %s\n' "$share" "$share"
+fi
 case ":$PATH:" in
   *":$INSTALL_DIR:"*) ;;
   *)
