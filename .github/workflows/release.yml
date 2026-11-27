@@ -109,6 +109,11 @@ jobs:
             CGO_ENABLED=0 GOOS="${target%/*}" GOARCH="${target#*/}" go build -trimpath \
               -ldflags "-s -w -X ${module}/cli.Version=${version}" \
               -o "dist/${name}/bit" ./cmd/bit
+            # The worker plugin beside it: bit update swaps both, and
+            # `bit plugin install <archive>/worker` installs it.
+            (cd plugins/worker && CGO_ENABLED=0 GOOS="${target%/*}" GOARCH="${target#*/}" go build -trimpath \
+              -ldflags "-s -w" -o "../../dist/${name}/worker/bin/bit-worker" .)
+            cp -R plugins/worker/.bit plugins/worker/.claude-plugin "dist/${name}/worker/"
             COPYFILE_DISABLE=1 tar -C dist -czf "dist/${name}.tar.gz" "$name"
             rm -rf "dist/${name}"
           done
@@ -229,6 +234,22 @@ jobs:
       - name: Create checksums
         working-directory: dist
         run: sha256sum -- * > checksums.txt
+
+      # latest.json: what bit update and the cloud's Workers page read, the
+      # version and each target's CLI archive.
+      - name: Create latest.json
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          base="https://github.com/${{ github.repository }}/releases/download/${RELEASE_TAG}"
+          jq -n --arg v "$version" --arg base "$base" --rawfile sums checksums.txt '
+            {version: $v, cli: ($sums | split("\n") | map(select(endswith(".tar.gz")) | split("  ")
+              | select(.[1] | startswith("bit-" + $v + "-")))
+              | map({key: (.[1] | ltrimstr("bit-" + $v + "-") | rtrimstr(".tar.gz")), value: {url: ($base + "/" + .[1]), sha256: .[0]}})
+              | from_entries)}' > latest.json
+          cat latest.json
+          [[ "$(jq '.cli | length' latest.json)" == 4 ]]
 
       - name: Publish release
         env:
